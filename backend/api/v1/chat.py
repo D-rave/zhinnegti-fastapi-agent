@@ -25,9 +25,9 @@ memory_vector_service = MemoryVectorService()
 
 
 async def get_or_create_session(
-        session_id: str,
-        user_id: int,
-        db: AsyncSession
+    session_id: str,
+    user_id: int,
+    db: AsyncSession
 ) -> ChatSession:
     """获取或创建会话"""
     if session_id:
@@ -35,7 +35,6 @@ async def get_or_create_session(
         if session:
             return session
 
-    # 创建新会话
     new_session = await session_crud.create(db, obj_in={
         "session_id": str(uuid.uuid4()),
         "user_id": user_id,
@@ -46,10 +45,10 @@ async def get_or_create_session(
 
 @router.post("/send")
 async def chat_send(
-        req: ChatRequest,
-        request: Request,
-        db: AsyncSession = Depends(get_db),
-        current_user: User = Depends(get_current_user_optional)
+    req: ChatRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_optional)
 ):
     """发送消息（SSE 流式）"""
     if not req.message or not req.message.strip():
@@ -66,34 +65,36 @@ async def chat_send(
         "content": req.message
     })
 
-    # 获取 MCP 工具
     mcp_tools = getattr(request.app.state, "mcp_tools", []) or []
 
     # 获取记忆
     memory_text = ""
     if current_user:
-        memory_text = memory_vector_service.retrieve_for_query(
+        memory_text = await memory_vector_service.retrieve_for_query_async(
             current_user.id, req.message, k=3
         )
 
-    # 获取历史
+    # 获取历史（安全排除当前这条用户消息）
     history = await message_crud.get_by_session(db, session_id)
-    history = [{"role": m.role, "content": m.content} for m in history[:-1]]
+    history = [{"role": m.role, "content": m.content} for m in history]
+    if history and history[-1].get("role") == "user":
+        history = history[:-1]
 
     agent = ReactAgent(extra_tools=mcp_tools, memory_text=memory_text)
 
     async def event_generator() -> AsyncGenerator[dict, None]:
         full_response = []
+        chunk_count = 0
 
         async with async_session_maker() as inner_db:
             try:
+                # 发送 session ID
                 yield {"event": "session", "data": session_id}
+                logger.info(f"[event_generator] session 已发送: {session_id}")
 
                 res_stream = agent.async_execute_stream(req.message, history=history)
 
-                # ========== 【修改】透传 Agent 已清理过的流式输出 ==========
-                # V4.4 Agent 已经不会把 TOOL_CALL 等中间过程暴露给前端
-                # 这里直接透传，不再做模糊过滤（避免误伤正常回答里的"思考"等词）
+                # 【关键】遍历 Agent 流式输出
                 async for chunk in res_stream:
                     if not chunk:
                         continue
@@ -101,11 +102,15 @@ async def chat_send(
                     stripped = chunk.strip()
                     if stripped:
                         full_response.append(chunk)
+                        chunk_count += 1
+                        logger.info(f"[event_generator] 第 {chunk_count} 个 chunk, 长度: {len(chunk)}")
                         yield {"event": "message", "data": chunk}
-                        await asyncio.sleep(0.005)
-                # ========== 透传结束 ==========
+                    await asyncio.sleep(0.005)
 
+                # 保存完整回复到数据库
                 complete_text = "".join(full_response)
+                logger.info(f"[event_generator] 流式完成, 共 {chunk_count} 个 chunk, 总长度: {len(complete_text)}")
+
                 if complete_text:
                     await message_crud.create(inner_db, obj_in={
                         "session_id": session_id,
@@ -113,23 +118,31 @@ async def chat_send(
                         "content": complete_text
                     })
 
-                # 触发记忆总结
-                if current_user:
+                # 记忆总结使用独立的新 session
+                if current_user and complete_text:
                     try:
                         from services.memory_service import MemoryService
                         memory_service = MemoryService()
-                        asyncio.create_task(
-                            memory_service.summarize_conversation(
-                                inner_db, session_id, current_user.id
-                            )
-                        )
+
+                        async def _do_summarize():
+                            async with async_session_maker() as summary_db:
+                                try:
+                                    await memory_service.summarize_conversation(
+                                        summary_db, session_id, current_user.id
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"记忆总结失败: {e}")
+
+                        asyncio.create_task(_do_summarize())
                     except Exception as e:
-                        logger.warning(f"记忆总结失败: {e}")
+                        logger.warning(f"记忆总结任务创建失败: {e}")
 
                 yield {"event": "done", "data": ""}
+                logger.info("[event_generator] done 事件已发送")
 
             except asyncio.CancelledError:
                 partial = "".join(full_response)
+                logger.info(f"[event_generator] 用户取消, 已收到 {chunk_count} 个 chunk, 部分长度: {len(partial)}")
                 if partial:
                     await message_crud.create(inner_db, obj_in={
                         "session_id": session_id,
@@ -139,24 +152,23 @@ async def chat_send(
                 raise
 
             except Exception as e:
-                logger.error(f"聊天处理错误: {e}", exc_info=True)
+                logger.error(f"[event_generator] 聊天处理错误: {e}", exc_info=True)
                 yield {"event": "error", "data": f"处理出错: {str(e)}"}
 
-    # ========== 【修改】添加防缓冲头，确保 Nginx/代理不缓存 SSE ==========
     return EventSourceResponse(
         event_generator(),
         headers={
             "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",  # 禁用 Nginx 缓冲，关键！
+            "X-Accel-Buffering": "no",
         }
     )
 
 
 @router.post("/clear", response_model=ResponseBase)
 async def clear_chat(
-        req: ClearRequest,
-        current_user: User = Depends(get_current_user_optional),
-        db: AsyncSession = Depends(get_db)
+    req: ClearRequest,
+    current_user: User = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db)
 ):
     """清空会话"""
     count = await message_crud.delete_by_session(db, req.session_id)
@@ -169,9 +181,9 @@ async def clear_chat(
 
 @router.get("/history", response_model=ChatHistoryResponse)
 async def get_history(
-        session_id: str,
-        current_user: User = Depends(get_current_user_optional),
-        db: AsyncSession = Depends(get_db)
+    session_id: str,
+    current_user: User = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db)
 ):
     """获取历史记录"""
     messages = await message_crud.get_by_session(db, session_id)
@@ -184,19 +196,17 @@ async def get_history(
 
 @router.get("/sessions", response_model=SessionListResponse)
 async def get_sessions(
-        current_user: User = Depends(get_current_user),
-        db: AsyncSession = Depends(get_db)
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """获取会话列表"""
     if not current_user:
         raise HTTPException(status_code=401, detail="请先登录")
 
-    # 查缓存
     cached = await RedisCache.get_cached_sessions(current_user.id)
     if cached is not None:
         return {"success": True, "sessions": cached}
 
-    # 查数据库
     sessions = await session_crud.get_by_user(db, current_user.id)
     session_list = [
         {
@@ -208,7 +218,6 @@ async def get_sessions(
         for s in sessions
     ]
 
-    # 写缓存
     await RedisCache.cache_sessions(current_user.id, session_list)
 
     return {"success": True, "sessions": session_list}

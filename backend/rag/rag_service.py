@@ -1,6 +1,7 @@
 """
 总结服务类：用户提问，搜索参考资料，将提问和参考资料提交给模型，让模型总结回复
 【增强版】新增查询扩展（Query Expansion），提升检索召回率
+【修复】同步 LLM 调用改为异步 ainvoke，避免阻塞事件循环
 """
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
@@ -30,9 +31,10 @@ class RagSummarizeService(object):
         chain = self.prompt_template | print_prompt | self.model | StrOutputParser()
         return chain
 
-    def _expand_query(self, query: str) -> list[str]:
+    async def _expand_query(self, query: str) -> list[str]:
         """
         查询扩展：用 LLM 把用户问题改写成 3 个更精准的专业检索词
+        【修复】改为异步 ainvoke
         """
         expansion_prompt = """你是扫地机器人领域的查询扩展专家。
 请将用户的问题扩展为 3 个不同角度的检索词，帮助从知识库找到更全面的信息。
@@ -47,9 +49,10 @@ class RagSummarizeService(object):
 
 扩展检索词："""
 
-        response = self.model.invoke(expansion_prompt.format(query=query)).content
+        response = await self.model.ainvoke(expansion_prompt.format(query=query))
+        content = response.content if hasattr(response, "content") else str(response)
 
-        expanded = [q.strip() for q in response.strip().split("\n") if q.strip()]
+        expanded = [q.strip() for q in content.strip().split("\n") if q.strip()]
 
         all_queries = [query] + expanded
         seen = set()
@@ -85,9 +88,9 @@ class RagSummarizeService(object):
         print(f"[Multi-Retrieve] 原始检索 {len(all_docs)} 篇，去重后 {len(unique_docs)} 篇")
         return unique_docs[:10]
 
-    def rag_summarize(self, query: str) -> str:
-        # 查询扩展 + 多查询检索
-        expanded_queries = self._expand_query(query)
+    async def rag_summarize(self, query: str) -> str:
+        """【修复】整体改为 async，内部调用 ainvoke"""
+        expanded_queries = await self._expand_query(query)
         context_docs = self.retriever_docs_multi(expanded_queries)
 
         context = ""
@@ -96,7 +99,8 @@ class RagSummarizeService(object):
             counter += 1
             context += f"【参考资料{counter}】: 参考资料：{doc.page_content} | 参考元数据：{doc.metadata}\n"
 
-        return self.chain.invoke(
+        # 【修复】使用 ainvoke 避免阻塞
+        return await self.chain.ainvoke(
             {
                 "input": query,
                 "context": context,

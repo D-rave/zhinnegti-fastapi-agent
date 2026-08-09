@@ -1,9 +1,10 @@
 """
-长期记忆服务 V3
+长期记忆服务 V4
 修复：
 1. UserProfile 插入时补充 category 和 source_session 字段
 2. 对话结束后自动提取摘要和关键事实
 3. 同时保存到 SQLite（持久化）和 Chroma 向量库（语义检索）
+4. 【修复】向量库操作改为异步，避免阻塞事件循环
 """
 import json
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,7 +37,6 @@ class MemoryService:
         )
         messages = result.scalars().all()
 
-        # ========== 修改：删除消息数量限制，任何对话都总结 ==========
         if not messages:
             logger.info(f"[长期记忆] 会话 {session_id[:8]}... 无消息，跳过总结")
             return
@@ -54,8 +54,8 @@ class MemoryService:
 
 请按以下 JSON 格式输出：
 {{
-  "summary": "对话摘要（50字以内）",
-  "facts": ["关键事实1", "关键事实2", ...]
+    "summary": "对话摘要（50字以内）",
+    "facts": ["关键事实1", "关键事实2", ...]
 }}
 
 只输出 JSON，不要其他内容。"""
@@ -87,22 +87,22 @@ class MemoryService:
             )
             db.add(summary)
 
-            # 5. 保存到 Chroma 向量库（用于语义检索）
+            # 5. 保存到 Chroma 向量库（【修复】改为异步）
             if summary_text:
-                memory_vector_service.save_summary(user_id, summary_text)
+                await memory_vector_service.save_summary_async(user_id, summary_text)
 
             # 6. 保存每个关键事实到 SQLite UserProfile 和 Chroma
             for fact in facts:
                 if fact:
-                    # Chroma 向量库
-                    memory_vector_service.save_fact(user_id, fact)
+                    # Chroma 向量库（异步）
+                    await memory_vector_service.save_fact_async(user_id, fact)
 
-                    # SQLite UserProfile（修复：补充 category 和 source_session）
+                    # SQLite UserProfile
                     profile = UserProfile(
                         user_id=user_id,
-                        category="fact",           # ← 修复：添加 category
+                        category="fact",
                         content=fact,
-                        source_session=session_id   # ← 修复：添加来源会话
+                        source_session=session_id
                     )
                     db.add(profile)
 

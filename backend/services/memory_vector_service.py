@@ -1,11 +1,14 @@
 """
-记忆向量检索服务
+记忆向量检索服务 V2
 功能：
 1. 将用户画像和会话摘要向量化存入 Chroma
 2. 对话前根据用户问题检索最相关的记忆片段（top-k）
 3. 只注入相关记忆，避免全量注入导致上下文过长
+
+【修复】所有同步 Chroma 操作改为异步包装，避免阻塞 FastAPI 事件循环
 """
 import os
+import asyncio
 from typing import List
 
 from langchain_chroma import Chroma
@@ -42,12 +45,8 @@ class MemoryVectorStore:
         )
         logger.info(f"[记忆向量] 初始化用户 {user_id} 的记忆库: {collection_name}")
 
-    def add_memory(self, content: str, memory_type: str = "profile"):
-        """
-        添加记忆片段
-        :param content: 记忆内容
-        :param memory_type: 类型 - profile(画像) / summary(摘要) / fact(事实)
-        """
+    def _add_memory_sync(self, content: str, memory_type: str = "profile"):
+        """同步：添加记忆片段"""
         doc = Document(
             page_content=content,
             metadata={"type": memory_type, "user_id": self.user_id}
@@ -55,24 +54,31 @@ class MemoryVectorStore:
         self.vectorstore.add_documents([doc])
         logger.info(f"[记忆向量] 用户 {self.user_id} 添加 {memory_type}: {content[:50]}...")
 
-    def search_relevant(self, query: str, k: int = 3) -> List[str]:
-        """
-        根据查询问题检索最相关的记忆片段
-        :param query: 用户当前问题
-        :param k: 返回 top-k 条
-        :return: 记忆文本列表
-        """
+    async def add_memory_async(self, content: str, memory_type: str = "profile"):
+        """异步：添加记忆片段"""
+        await asyncio.to_thread(self._add_memory_sync, content, memory_type)
+
+    def _search_relevant_sync(self, query: str, k: int = 3) -> List[str]:
+        """同步：检索相关记忆"""
         results = self.vectorstore.similarity_search(query, k=k)
         memories = [doc.page_content for doc in results]
         logger.info(f"[记忆向量] 用户 {self.user_id} 检索 '{query[:30]}...' 命中 {len(memories)} 条记忆")
         for i, m in enumerate(memories):
-            logger.info(f"[记忆向量]  top-{i+1}: {m[:80]}...")
+            logger.info(f"[记忆向量] top-{i+1}: {m[:80]}...")
         return memories
 
-    def clear(self):
-        """清空该用户的所有记忆"""
+    async def search_relevant_async(self, query: str, k: int = 3) -> List[str]:
+        """异步：检索相关记忆"""
+        return await asyncio.to_thread(self._search_relevant_sync, query, k)
+
+    def _clear_sync(self):
+        """同步：清空记忆"""
         self.vectorstore.delete_collection()
         logger.info(f"[记忆向量] 用户 {self.user_id} 记忆库已清空")
+
+    async def clear_async(self):
+        """异步：清空记忆"""
+        await asyncio.to_thread(self._clear_sync)
 
 
 class MemoryVectorService:
@@ -90,32 +96,47 @@ class MemoryVectorService:
             self._store_cache[user_id] = MemoryVectorStore(user_id)
         return self._store_cache[user_id]
 
+    # ---------- 同步方法（保留兼容） ----------
     def save_profile(self, user_id: int, content: str):
-        """保存用户画像"""
         store = self._get_store(user_id)
-        store.add_memory(content, memory_type="profile")
+        store._add_memory_sync(content, memory_type="profile")
 
     def save_summary(self, user_id: int, content: str):
-        """保存会话摘要"""
         store = self._get_store(user_id)
-        store.add_memory(content, memory_type="summary")
+        store._add_memory_sync(content, memory_type="summary")
 
     def save_fact(self, user_id: int, content: str):
-        """保存关键事实"""
         store = self._get_store(user_id)
-        store.add_memory(content, memory_type="fact")
+        store._add_memory_sync(content, memory_type="fact")
 
     def retrieve_for_query(self, user_id: int, query: str, k: int = 3) -> str:
-        """
-        根据用户问题检索相关记忆，格式化为文本
-        :return: 格式化的记忆文本，可直接注入系统提示词
-        """
         store = self._get_store(user_id)
-        memories = store.search_relevant(query, k=k)
-
+        memories = store._search_relevant_sync(query, k=k)
         if not memories:
             return ""
+        memory_text = "【相关记忆】\n"
+        for i, m in enumerate(memories, 1):
+            memory_text += f"{i}. {m}\n"
+        return memory_text
 
+    # ---------- 异步方法（推荐在 async 路由中使用）----------
+    async def save_profile_async(self, user_id: int, content: str):
+        store = self._get_store(user_id)
+        await store.add_memory_async(content, memory_type="profile")
+
+    async def save_summary_async(self, user_id: int, content: str):
+        store = self._get_store(user_id)
+        await store.add_memory_async(content, memory_type="summary")
+
+    async def save_fact_async(self, user_id: int, content: str):
+        store = self._get_store(user_id)
+        await store.add_memory_async(content, memory_type="fact")
+
+    async def retrieve_for_query_async(self, user_id: int, query: str, k: int = 3) -> str:
+        store = self._get_store(user_id)
+        memories = await store.search_relevant_async(query, k=k)
+        if not memories:
+            return ""
         memory_text = "【相关记忆】\n"
         for i, m in enumerate(memories, 1):
             memory_text += f"{i}. {m}\n"
@@ -124,7 +145,13 @@ class MemoryVectorService:
     def clear_user_memory(self, user_id: int):
         """清空某用户的全部记忆"""
         if user_id in self._store_cache:
-            self._store_cache[user_id].clear()
+            self._store_cache[user_id]._clear_sync()
+            del self._store_cache[user_id]
+
+    async def clear_user_memory_async(self, user_id: int):
+        """异步清空某用户的全部记忆"""
+        if user_id in self._store_cache:
+            await self._store_cache[user_id].clear_async()
             del self._store_cache[user_id]
 
 

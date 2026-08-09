@@ -1,101 +1,190 @@
+// frontend/src/stores/chat.js
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
-import { getToken } from '@/utils/auth'
+import { ref, computed, nextTick } from 'vue'
+import { useUserStore } from './user'
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8011/api'
 
-// 内联 sendMessage，绕过 api/chat.js 的缓存问题
+const apiFetch = async (url, options = {}) => {
+  const userStore = useUserStore()
+  const token = userStore.token
+
+  const headers = {
+    ...options.headers,
+    'Authorization': token ? `Bearer ${token}` : ''
+  }
+
+  if (options.body && !(options.body instanceof FormData)) {
+    headers['Content-Type'] = 'application/json'
+  }
+
+  const res = await fetch(`${BASE_URL}${url}`, {
+    ...options,
+    headers
+  })
+
+  if (res.status === 401) {
+    userStore.logout()
+    window.location.href = '/login'
+    throw new Error('登录已过期，请重新登录')
+  }
+
+  return res.json()
+}
+
+// ==================== 【关键修复】超健壮 SSE 解析 ====================
+const parseSSEEvents = (text) => {
+  /**
+   * 解析 SSE 文本为事件数组
+   * 兼容：\n\n 分隔、\r\n\r\n 分隔、多余空行、多行 data
+   */
+  if (!text || !text.trim()) return []
+
+  // 统一换行符为 \n
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+
+  // 按 \n\n 分割事件块（兼容多个连续空行）
+  const rawBlocks = normalized.split(/\n\n+/)
+  const events = []
+
+  for (const rawBlock of rawBlocks) {
+    const block = rawBlock.trim()
+    if (!block) continue
+
+    const lines = block.split('\n')
+    let eventType = 'message'
+    const dataParts = []
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim()
+      if (!line) continue
+
+      if (line.startsWith('event:')) {
+        eventType = line.slice(6).trim()
+      } else if (line.startsWith('data:')) {
+        // data: 后面可能有一个空格，也可能没有
+        dataParts.push(line.slice(5).trimStart())
+      }
+    }
+
+    // 只收集有 data 或特殊事件类型的
+    if (dataParts.length > 0 || ['session', 'done', 'error'].includes(eventType)) {
+      events.push({ eventType, content: dataParts.join('\n') })
+    }
+  }
+
+  return events
+}
+
 const sendMessageInline = (data, callbacks) => {
   return new Promise((resolve, reject) => {
     const { onSession, onMessage, onDone, onError } = callbacks
-    const token = getToken()
+    const userStore = useUserStore()
+    const token = userStore.token
 
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `${BASE_URL}/chat/send`)
     xhr.setRequestHeader('Content-Type', 'application/json')
     if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
 
-    let buffer = ''
     let lastLen = 0
+    let messageCount = 0
+    let sessionReceived = false
+    let processedTextLen = 0  // 记录已处理到的位置，避免重复处理
+
+    // 处理新增文本中的 SSE 事件
+    const processNewText = (fullText, isFinal = false) => {
+      // 只处理新增部分
+      const newText = fullText.slice(processedTextLen)
+      if (!newText.trim()) return
+
+      const events = parseSSEEvents(newText)
+      console.log(`[SSE] 解析到 ${events.length} 个事件 (新增 ${newText.length} 字节)`)
+
+      for (const { eventType, content } of events) {
+        console.log(`[SSE] 事件: type=${eventType}, len=${content?.length || 0}, content=${content?.slice(0, 30)}`)
+
+        if (eventType === 'session') {
+          sessionReceived = true
+          onSession?.(content)
+        }
+        else if (eventType === 'message' && content) {
+          messageCount++
+          onMessage?.(content)
+        }
+        else if (eventType === 'done') {
+          onDone?.()
+        }
+        else if (eventType === 'error') {
+          onError?.(content)
+        }
+      }
+
+      // 更新已处理位置（如果不是最终处理，留一点缓冲给不完整的块）
+      if (isFinal) {
+        processedTextLen = fullText.length
+      } else {
+        // 找到最后一个完整 \n\n 的位置
+        const lastDoubleNewline = fullText.lastIndexOf('\n\n')
+        if (lastDoubleNewline > processedTextLen) {
+          processedTextLen = lastDoubleNewline + 2
+        }
+      }
+    }
 
     xhr.onprogress = () => {
-      const newChunk = xhr.responseText.slice(lastLen)
-      lastLen = xhr.responseText.length
-      if (!newChunk) return
-
-      buffer += newChunk
-
-      // 解析 SSE
-      const blocks = buffer.split('\n\n')
-      buffer = blocks.pop() || ''
-
-      for (const block of blocks) {
-        if (!block.trim()) continue
-
-        const lines = block.split('\n')
-        let eventType = 'message'
-        const dataParts = []
-
-        for (const line of lines) {
-          if (line.startsWith('event:')) {
-            eventType = line.slice(6).trim()
-          } else if (line.startsWith('data:')) {
-            dataParts.push(line.slice(5).trimStart())
-          }
-        }
-
-        const content = dataParts.join('\n')
-
-        if (eventType === 'session') onSession?.(content)
-        else if (eventType === 'message') onMessage?.(content)
-        else if (eventType === 'done') onDone?.()
-        else if (eventType === 'error') onError?.(content)
+      const currentLen = xhr.responseText.length
+      if (currentLen > lastLen) {
+        lastLen = currentLen
+        processNewText(xhr.responseText, false)
       }
     }
 
     xhr.onload = () => {
-      if (buffer.trim()) {
-        const lines = buffer.split('\n')
-        let eventType = 'message'
-        const dataParts = []
+      const fullText = xhr.responseText
+      console.log(`[SSE] onload 触发, responseText 总长度: ${fullText.length}`)
+      console.log(`[SSE] 原始内容前200字: ${fullText.slice(0, 200)}`)
+
+      // 最终处理：解析全部文本
+      processNewText(fullText, true)
+
+      console.log(`[SSE] 请求完成, session=${sessionReceived}, 共 ${messageCount} 条 message`)
+
+      // 如果还没触发 done，补一个
+      if (!sessionReceived && messageCount === 0 && fullText.length > 0) {
+        console.warn('[SSE] 警告: 没有解析到任何事件，尝试备用解析...')
+        // 备用：直接按行查找 data:
+        const lines = fullText.split('\n')
         for (const line of lines) {
-          if (line.startsWith('event:')) eventType = line.slice(6).trim()
-          else if (line.startsWith('data:')) dataParts.push(line.slice(5).trimStart())
+          const trimmed = line.trim()
+          if (trimmed.startsWith('data:')) {
+            const content = trimmed.slice(5).trimStart()
+            if (content) {
+              messageCount++
+              onMessage?.(content)
+            }
+          }
         }
-        const content = dataParts.join('\n')
-        if (eventType === 'message' && content) onMessage?.(content)
       }
+
       onDone?.()
       resolve()
     }
 
     xhr.onerror = () => {
+      console.error('[SSE] 网络请求失败')
       onError?.('网络请求失败')
       reject(new Error('网络请求失败'))
     }
 
+    xhr.ontimeout = () => {
+      console.error('[SSE] 请求超时')
+      onError?.('请求超时')
+      reject(new Error('请求超时'))
+    }
+
     xhr.send(JSON.stringify(data))
   })
-}
-
-// 其他 API 保持简单
-const apiGet = (url) => {
-  const token = getToken()
-  return fetch(`${BASE_URL}${url}`, {
-    headers: token ? { 'Authorization': `Bearer ${token}` } : {}
-  }).then(res => res.json())
-}
-
-const apiPost = (url, body) => {
-  const token = getToken()
-  return fetch(`${BASE_URL}${url}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': token ? `Bearer ${token}` : ''
-    },
-    body: JSON.stringify(body)
-  }).then(res => res.json())
 }
 
 export const useChatStore = defineStore('chat', () => {
@@ -104,12 +193,13 @@ export const useChatStore = defineStore('chat', () => {
   const messages = ref([])
   const isLoading = ref(false)
   const isStreaming = ref(false)
+  const isSending = ref(false)
 
   const hasMessages = computed(() => messages.value.length > 0)
 
   const loadSessions = async () => {
     try {
-      const res = await apiGet('/chat/sessions')
+      const res = await apiFetch('/chat/sessions')
       sessions.value = res.sessions || []
     } catch (error) {
       console.error('加载会话列表失败:', error)
@@ -117,15 +207,23 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   const createNewSession = () => {
+    if (isSending.value) {
+      console.warn('[Chat] 发送中，禁止新建会话')
+      return
+    }
     currentSessionId.value = ''
     messages.value = []
   }
 
   const selectSession = async (sessionId) => {
+    if (isSending.value) {
+      console.warn('[Chat] 发送中，禁止切换会话')
+      return
+    }
     currentSessionId.value = sessionId
     if (sessionId) {
       try {
-        const res = await apiGet(`/chat/history?session_id=${sessionId}`)
+        const res = await apiFetch(`/chat/history?session_id=${sessionId}`)
         messages.value = res.messages || []
       } catch (error) {
         console.error('加载历史记录失败:', error)
@@ -138,29 +236,38 @@ export const useChatStore = defineStore('chat', () => {
 
   const sendChatMessage = async (content) => {
     if (!content.trim()) return
+    if (isSending.value) {
+      console.warn('[Chat] 已有消息正在发送，请等待')
+      return
+    }
 
+    isSending.value = true
     isLoading.value = true
     isStreaming.value = true
 
-    // 创建新数组添加用户消息
     messages.value = [...messages.value, { role: 'user', content }]
+    await nextTick()
 
-    // 创建新数组添加 assistant 占位
     messages.value = [...messages.value, { role: 'assistant', content: '' }]
     const assistantIndex = messages.value.length - 1
+    await nextTick()
 
     let fullText = ''
+    let receivedAny = false
 
     try {
       await sendMessageInline(
         { message: content, session_id: currentSessionId.value },
         {
           onSession: (sessionId) => {
+            console.log(`[Chat] session 事件: ${sessionId}`)
             currentSessionId.value = sessionId
           },
           onMessage: (chunk) => {
+            receivedAny = true
             fullText += chunk
-            // 创建全新数组替换整个 messages，强制 Vue 响应式
+            console.log(`[Chat] 收到 chunk, 当前总长度: ${fullText.length}`)
+
             const newMessages = [...messages.value]
             newMessages[assistantIndex] = {
               role: 'assistant',
@@ -169,13 +276,17 @@ export const useChatStore = defineStore('chat', () => {
             messages.value = newMessages
           },
           onDone: () => {
+            console.log(`[Chat] 流式完成, 总长度: ${fullText.length}, 收到事件: ${receivedAny}`)
             isStreaming.value = false
             isLoading.value = false
+            isSending.value = false
             loadSessions()
           },
           onError: (error) => {
+            console.error(`[Chat] 流式错误: ${error}`)
             isStreaming.value = false
             isLoading.value = false
+            isSending.value = false
             const newMessages = [...messages.value]
             newMessages[assistantIndex] = {
               role: 'assistant',
@@ -186,8 +297,10 @@ export const useChatStore = defineStore('chat', () => {
         }
       )
     } catch (error) {
+      console.error(`[Chat] 请求异常: ${error.message}`)
       isStreaming.value = false
       isLoading.value = false
+      isSending.value = false
       const newMessages = [...messages.value]
       newMessages[assistantIndex] = {
         role: 'assistant',
@@ -203,7 +316,10 @@ export const useChatStore = defineStore('chat', () => {
       return
     }
     try {
-      await apiPost('/chat/clear', { session_id: currentSessionId.value })
+      await apiFetch('/chat/clear', {
+        method: 'POST',
+        body: JSON.stringify({ session_id: currentSessionId.value })
+      })
       messages.value = []
       await loadSessions()
     } catch (error) {
@@ -217,6 +333,7 @@ export const useChatStore = defineStore('chat', () => {
     messages,
     isLoading,
     isStreaming,
+    isSending,
     hasMessages,
     loadSessions,
     createNewSession,
