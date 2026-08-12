@@ -23,6 +23,8 @@ class UserResponse(UserBase):
     """用户信息响应"""
     id: int
     is_active: bool = True
+    is_admin: bool = False          # 【新增】管理员标识
+    role: str = "user"              # 【新增】用户角色
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -76,8 +76,8 @@ Base = declarative_base()
 
 
 # ========== 延迟导入所有模型，确保 Base.metadata 包含所有表 ==========
-# 使用 importlib 避免循环导入，同时让 SQLAlchemy 注册所有表
-for _model_module in ["models.user", "models.chat", "models.memory"]:
+# 【关键修复】新增 models.usage，确保 llm_usage_logs 表被创建
+for _model_module in ["models.user", "models.chat", "models.memory", "models.usage"]:
     try:
         importlib.import_module(_model_module)
         logger.info(f"[数据库] 模型模块已加载: {_model_module}")

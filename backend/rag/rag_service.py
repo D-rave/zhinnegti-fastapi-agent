@@ -2,14 +2,16 @@
 总结服务类：用户提问，搜索参考资料，将提问和参考资料提交给模型，让模型总结回复
 【增强版】新增查询扩展（Query Expansion），提升检索召回率
 【修复】同步 LLM 调用改为异步 ainvoke，避免阻塞事件循环
+【新增】接入 DashScope Token 用量追踪
 """
+import time
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from rag.vector_store import VectorStoreService
 from utils.prompt_loader import load_rag_prompts
 from langchain_core.prompts import PromptTemplate
 from model.factory import chat_model
-
+from core.dashscope_usage_tracker import track_llm_call
 
 def print_prompt(prompt):
     print("=" * 20)
@@ -25,16 +27,11 @@ class RagSummarizeService(object):
         self.prompt_text = load_rag_prompts()
         self.prompt_template = PromptTemplate.from_template(self.prompt_text)
         self.model = chat_model
-        self.chain = self._init_chain()
-
-    def _init_chain(self):
-        chain = self.prompt_template | print_prompt | self.model | StrOutputParser()
-        return chain
+        self.model_name = getattr(self.model, "model_name", "qwen-max")
 
     async def _expand_query(self, query: str) -> list[str]:
         """
         查询扩展：用 LLM 把用户问题改写成 3 个更精准的专业检索词
-        【修复】改为异步 ainvoke
         """
         expansion_prompt = """你是扫地机器人领域的查询扩展专家。
 请将用户的问题扩展为 3 个不同角度的检索词，帮助从知识库找到更全面的信息。
@@ -49,7 +46,17 @@ class RagSummarizeService(object):
 
 扩展检索词："""
 
+        start = time.time()
         response = await self.model.ainvoke(expansion_prompt.format(query=query))
+        latency = (time.time() - start) * 1000
+
+        await track_llm_call(
+            response=response,
+            model_name=self.model_name,
+            latency_ms=latency,
+            endpoint="rag.expand_query"
+        )
+
         content = response.content if hasattr(response, "content") else str(response)
 
         expanded = [q.strip() for q in content.strip().split("\n") if q.strip()]
@@ -89,20 +96,29 @@ class RagSummarizeService(object):
         return unique_docs[:10]
 
     async def rag_summarize(self, query: str) -> str:
-        """【修复】整体改为 async，内部调用 ainvoke"""
+        """RAG 总结：检索 + LLM 生成"""
         expanded_queries = await self._expand_query(query)
         context_docs = self.retriever_docs_multi(expanded_queries)
 
         context = ""
-        counter = 0
-        for doc in context_docs:
-            counter += 1
-            context += f"【参考资料{counter}】: 参考资料：{doc.page_content} | 参考元数据：{doc.metadata}\n"
+        for i, doc in enumerate(context_docs, 1):
+            context += f"【参考资料{i}】: 参考资料：{doc.page_content} | 参考元数据：{doc.metadata}\n"
 
-        # 【修复】使用 ainvoke 避免阻塞
-        return await self.chain.ainvoke(
-            {
-                "input": query,
-                "context": context,
-            }
+        # 构建 prompt 并打印
+        prompt_value = self.prompt_template.invoke({"input": query, "context": context})
+        print_prompt(prompt_value)
+
+        # 直接调用模型以获取 token_usage
+        start = time.time()
+        response = await self.model.ainvoke(prompt_value)
+        latency = (time.time() - start) * 1000
+
+        await track_llm_call(
+            response=response,
+            model_name=self.model_name,
+            latency_ms=latency,
+            endpoint="rag.rag_summarize"
         )
+
+        result = StrOutputParser().invoke(response)
+        return result

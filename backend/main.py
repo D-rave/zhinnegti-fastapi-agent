@@ -1,7 +1,9 @@
 """
-FastAPI 后端入口 - V4 生产级
+FastAPI 后端入口 - V5 生产级
+集成：DashScope 用量追踪 + 监控告警（Prometheus + Sentry）+ 安全加固
 """
 import os
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -9,13 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from utils.logger_handler import logger
 from models.db import engine, Base, DB_TYPE
+from models.usage import LLMUsageLog  # 确保用量表被注册到 metadata
 from middlewares.error_handler import setup_exception_handlers
 from middlewares.rate_limit import RateLimitMiddleware
 from middlewares.request_log import RequestLogMiddleware
 from core.config import get_settings
 from api.v1 import api_router
 from utils.redis_client import close_redis
-
+from core.dashscope_usage_tracker import usage_tracker
 settings = get_settings()
 
 
@@ -66,10 +69,43 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[Redis] 连接失败: {e}（降级为无缓存模式）")
 
+    # 【监控】初始化 Sentry
+    from monitoring.sentry_integration import init_sentry
+    init_sentry()
+
+    # 【监控】初始化 Prometheus 应用信息
+    from monitoring.prometheus_metrics import init_app_info
+    init_app_info()
+
+    # 【用量追踪】保留定时刷盘任务（数据库版仅清空 buffer，兼容旧代码）
+    async def _periodic_flush():
+        while True:
+            await asyncio.sleep(60)
+            try:
+                from core.dashscope_usage_tracker import usage_tracker
+                await usage_tracker.flush_to_redis()
+            except Exception as e:
+                logger.warning(f"[UsageTracker] 定时刷盘失败: {e}")
+
+    flush_task = asyncio.create_task(_periodic_flush())
+
     logger.info(f"[系统启动] {settings.APP_NAME} V{settings.APP_VERSION} 已启动")
     yield
 
     # 关闭清理
+    flush_task.cancel()
+    try:
+        await flush_task
+    except asyncio.CancelledError:
+        pass
+
+    # 最终刷盘（数据库版仅清空 buffer）
+    try:
+        from core.dashscope_usage_tracker import usage_tracker
+        await usage_tracker.flush_to_redis()
+    except Exception as e:
+        logger.warning(f"[UsageTracker] 最终刷盘失败: {e}")
+
     try:
         await mcp.close()
     except Exception as e:
@@ -87,30 +123,33 @@ app = FastAPI(
     redoc_url="/redoc" if settings.DEBUG else None,
 )
 
-# ========== 中间件注册（CORS 必须最先注册，确保预检请求被正确拦截）==========
+# ========== 中间件注册（顺序很重要）==========
 
-# 1. CORS（最先注册，确保 OPTIONS 预检请求直接返回 200）
+# 1. CORS（最先注册，处理预检请求）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 开发环境直接放行所有来源
-    allow_credentials=False,  # allow_origins=["*"] 时 credentials 必须为 False
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
     max_age=600,
 )
 
-# 2. 请求日志（纯 ASGI 中间件，不干扰请求对象）
+# 2. 【监控】Prometheus 指标收集（在请求日志之前，确保记录所有请求）
+from monitoring.prometheus_middleware import PrometheusMiddleware
+app.add_middleware(PrometheusMiddleware)
+
+# 3. 请求日志
 app.add_middleware(RequestLogMiddleware)
 
-# 3. 速率限制（纯 ASGI 中间件，跳过 OPTIONS）
+# 4. 速率限制
 app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.RATE_LIMIT_PER_MINUTE)
 
 # ========== 异常处理 ==========
 setup_exception_handlers(app)
 
 # ========== 路由注册 ==========
-# 健康检查（无版本前缀）
 @app.get("/api/health")
 async def health_check():
     from mcp_client import get_mcp_client
@@ -135,6 +174,10 @@ async def health_check():
         "mcp": stats,
         "redis": redis_status,
     }
+
+# 【监控】Prometheus 指标路由
+from monitoring.prometheus_metrics import router as metrics_router
+app.include_router(metrics_router, prefix="/metrics")
 
 # API v1 路由
 app.include_router(api_router, prefix="/api")

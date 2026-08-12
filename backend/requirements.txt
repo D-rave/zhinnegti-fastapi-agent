@@ -39,3 +39,6 @@ requests>=2.31.0
 
 # 数据校验
 pydantic>=2.0.0
+# 监控
+prometheus-client>=0.20.0
+sentry-sdk[fastapi]>=1.40.0

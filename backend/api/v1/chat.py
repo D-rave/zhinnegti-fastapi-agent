@@ -1,4 +1,4 @@
-"""聊天 API（重构版）"""
+"""聊天 API（重构版 + DashScope 用量追踪 + 输入净化 + 自动标题生成）"""
 import asyncio
 import uuid
 from typing import AsyncGenerator
@@ -6,6 +6,7 @@ from typing import AsyncGenerator
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
 
 from models.db import get_db, async_session_maker
 from models.chat import ChatSession, ChatMessage
@@ -18,6 +19,7 @@ from services.memory_vector_service import MemoryVectorService
 from utils.redis_client import RedisCache
 from utils.logger_handler import logger
 from api.deps import get_current_user, get_current_user_optional
+from core.security_enhanced import InputSanitizer
 
 router = APIRouter()
 
@@ -43,6 +45,38 @@ async def get_or_create_session(
     return new_session
 
 
+# ========== 自动标题生成 ==========
+async def generate_session_title(db: AsyncSession, session_id: str, first_message: str) -> str:
+    """
+    用 LLM 根据第一条用户消息生成会话标题
+    标题要求：10字以内，简洁明了
+    """
+    try:
+        from model.factory import chat_model
+
+        prompt = f"""请根据用户的提问，生成一个简短的会话标题（10字以内）。
+要求：不要加标点符号，不要加"咨询""关于"等前缀，直接描述核心主题。
+
+用户提问：{first_message[:100]}
+
+标题："""
+
+        response = await chat_model.ainvoke(prompt)
+        title = response.content if hasattr(response, "content") else str(response)
+
+        title = title.strip().replace('"', '').replace("'", "").replace("《", "").replace("》", "")
+        if len(title) > 15:
+            title = title[:15]
+        if not title:
+            title = "新对话"
+
+        logger.info(f"[TitleGen] 会话 {session_id} 生成标题: {title}")
+        return title
+    except Exception as e:
+        logger.warning(f"[TitleGen] 生成标题失败: {e}")
+        return "新对话"
+
+
 @router.post("/send")
 async def chat_send(
     req: ChatRequest,
@@ -54,33 +88,43 @@ async def chat_send(
     if not req.message or not req.message.strip():
         raise HTTPException(status_code=400, detail="消息不能为空")
 
+    safe_message = InputSanitizer.sanitize(req.message, max_length=2000, context="chat")
+    if not safe_message:
+        raise HTTPException(status_code=400, detail="消息内容包含非法字符或为空")
+
+    log_safe = InputSanitizer.mask_sensitive_for_log(safe_message[:50])
+    logger.info(f"[Chat] 用户 {current_user.id if current_user else 'anon'} 发送消息: {log_safe}")
+
     user_id = current_user.id if current_user else None
     session = await get_or_create_session(req.session_id, user_id, db)
     session_id = session.session_id
+    is_new_session = session.title == "新对话"
 
-    # 保存用户消息
     await message_crud.create(db, obj_in={
         "session_id": session_id,
         "role": "user",
-        "content": req.message
+        "content": safe_message
     })
 
     mcp_tools = getattr(request.app.state, "mcp_tools", []) or []
 
-    # 获取记忆
     memory_text = ""
     if current_user:
         memory_text = await memory_vector_service.retrieve_for_query_async(
-            current_user.id, req.message, k=3
+            current_user.id, safe_message, k=3
         )
 
-    # 获取历史（安全排除当前这条用户消息）
     history = await message_crud.get_by_session(db, session_id)
     history = [{"role": m.role, "content": m.content} for m in history]
     if history and history[-1].get("role") == "user":
         history = history[:-1]
 
-    agent = ReactAgent(extra_tools=mcp_tools, memory_text=memory_text)
+    agent = ReactAgent(
+        extra_tools=mcp_tools,
+        memory_text=memory_text,
+        user_id=user_id,
+        session_id=session_id
+    )
 
     async def event_generator() -> AsyncGenerator[dict, None]:
         full_response = []
@@ -88,13 +132,11 @@ async def chat_send(
 
         async with async_session_maker() as inner_db:
             try:
-                # 发送 session ID
                 yield {"event": "session", "data": session_id}
                 logger.info(f"[event_generator] session 已发送: {session_id}")
 
-                res_stream = agent.async_execute_stream(req.message, history=history)
+                res_stream = agent.async_execute_stream(safe_message, history=history)
 
-                # 【关键】遍历 Agent 流式输出
                 async for chunk in res_stream:
                     if not chunk:
                         continue
@@ -105,9 +147,8 @@ async def chat_send(
                         chunk_count += 1
                         logger.info(f"[event_generator] 第 {chunk_count} 个 chunk, 长度: {len(chunk)}")
                         yield {"event": "message", "data": chunk}
-                    await asyncio.sleep(0.005)
+                        await asyncio.sleep(0.005)
 
-                # 保存完整回复到数据库
                 complete_text = "".join(full_response)
                 logger.info(f"[event_generator] 流式完成, 共 {chunk_count} 个 chunk, 总长度: {len(complete_text)}")
 
@@ -118,7 +159,28 @@ async def chat_send(
                         "content": complete_text
                     })
 
-                # 记忆总结使用独立的新 session
+                # ========== 自动标题生成 ==========
+                if is_new_session and complete_text and current_user:
+                    user_msg_count = await inner_db.scalar(
+                        select(func.count(ChatMessage.id)).where(
+                            ChatMessage.session_id == session_id,
+                            ChatMessage.role == "user"
+                        )
+                    )
+                    if user_msg_count == 1:
+                        title = await generate_session_title(inner_db, session_id, safe_message)
+                        # 【关键修复】在 inner_db 中重新查询 session 对象，避免跨 Session 绑定错误
+                        session_in_inner = await session_crud.get_by_session_id(inner_db, session_id)
+                        if session_in_inner:
+                            await session_crud.update(
+                                inner_db,
+                                db_obj=session_in_inner,
+                                obj_in={"title": title}
+                            )
+                            await RedisCache.invalidate_sessions(current_user.id)
+                            logger.info(f"[TitleGen] 会话 {session_id} 标题已更新: {title}")
+                # =======================================
+
                 if current_user and complete_text:
                     try:
                         from services.memory_service import MemoryService

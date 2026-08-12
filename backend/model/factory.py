@@ -1,4 +1,4 @@
-"""模型工厂 - 支持懒加载和异常降级"""
+"""模型工厂 - 支持懒加载、异常降级、模型名记录"""
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 from functools import lru_cache
@@ -18,45 +18,42 @@ class BaseModelFactory(ABC):
 
 
 class ChatModelFactory(BaseModelFactory):
-    @lru_cache(maxsize=1)
-    def generator(self) -> Optional[Embeddings | BaseChatModel]:
-        """懒加载聊天模型，失败时自动降级"""
-        model_name = rag_conf.get("chat_model_name", "qwen-turbo")
-
+    @lru_cache(maxsize=4)
+    def _get_model(self, model_name: str) -> Optional[BaseChatModel]:
+        """按模型名获取实例（带缓存）"""
         try:
             model = ChatTongyi(model=model_name)
+            # 【关键】用 object.__setattr__ 绕过 Pydantic 字段校验，附加模型名供用量追踪使用
+            object.__setattr__(model, "model_name", model_name)
             logger.info(f"[Model] 聊天模型初始化成功: {model_name}")
             return model
         except Exception as e:
             logger.error(f"[Model] 聊天模型 {model_name} 初始化失败: {e}")
+            raise
 
-            # 降级：尝试基础模型
-            fallback_name = "qwen-turbo"
-            if model_name != fallback_name:
-                try:
-                    model = ChatTongyi(model=fallback_name)
-                    logger.warning(f"[Model] 已降级到 {fallback_name}")
-                    return model
-                except Exception as e2:
-                    logger.error(f"[Model] 降级到 {fallback_name} 也失败: {e2}")
+    def generator(self, query: Optional[str] = None) -> BaseChatModel:
+        """
+        获取聊天模型
+        如果传入 query，自动根据复杂度路由到合适模型（当前默认 qwen-max）
+        """
+        model_name = rag_conf.get("chat_model_name", "qwen-max")
+        return self._get_model(model_name)
 
-            raise RuntimeError(
-                f"无法初始化聊天模型。请检查：\n"
-                f"1. DashScope API Key 是否设置（环境变量 DASHSCOPE_API_KEY）\n"
-                f"2. 网络是否通畅\n"
-                f"3. 模型名称 '{model_name}' 是否正确\n"
-                f"原始错误: {e}"
-            )
+    def generator_for_step(self, query: str, step: int = 1) -> BaseChatModel:
+        """Agent 步骤化模型选择（当前统一使用 qwen-max）"""
+        model_name = rag_conf.get("chat_model_name", "qwen-max")
+        return self._get_model(model_name)
 
 
 class EmbeddingsFactory(BaseModelFactory):
     @lru_cache(maxsize=1)
-    def generator(self) -> Optional[Embeddings | BaseChatModel]:
+    def generator(self) -> Optional[Embeddings]:
         """懒加载 Embedding 模型"""
-        model_name = rag_conf.get("embedding_model_name", "text-embedding-v1")
-
+        model_name = rag_conf.get("embedding_model_name", "text-embedding-v4")
         try:
             model = DashScopeEmbeddings(model=model_name)
+            # 【关键】用 object.__setattr__ 绕过 Pydantic 字段校验
+            object.__setattr__(model, "model_name", model_name)
             logger.info(f"[Model] Embedding 模型初始化成功: {model_name}")
             return model
         except Exception as e:

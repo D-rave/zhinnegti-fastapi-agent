@@ -28,7 +28,7 @@
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item command="profile">个人中心</el-dropdown-item>
-              <el-dropdown-item command="admin" v-if="userStore.isAdmin">管理后台</el-dropdown-item>
+              <el-dropdown-item command="dashboard">用量监控</el-dropdown-item>
               <el-dropdown-item divided command="logout">退出登录</el-dropdown-item>
             </el-dropdown-menu>
           </template>
@@ -141,8 +141,8 @@ const sendMessage = async () => {
 const handleCommand = (command) => {
   if (command === 'profile') {
     router.push('/profile')
-  } else if (command === 'admin') {
-    router.push('/admin')
+  } else if (command === 'dashboard') {  // 【改】与路由保持一致
+    router.push('/dashboard')
   } else if (command === 'logout') {
     userStore.logout()
     router.push('/login')

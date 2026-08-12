@@ -9,7 +9,12 @@ export const useUserStore = defineStore('user', () => {
   const loading = ref(false)
 
   const isLoggedIn = computed(() => !!token.value)
-  const isAdmin = computed(() => userInfo.value?.role === 'admin')
+
+  // 【关键修复】兼容 role 和 is_admin 两种字段
+  const isAdmin = computed(() => {
+    return userInfo.value?.role === 'admin' || userInfo.value?.is_admin === true
+  })
+
   const username = computed(() => userInfo.value?.username || '')
 
   const updateToken = (newToken) => {
@@ -49,30 +54,29 @@ export const useUserStore = defineStore('user', () => {
     }
   }
 
- const fetchUserInfo = async () => {
-  if (!token.value) {
-    userInfo.value = null
-    return
-  }
-  try {
-    const res = await getCurrentUser()
-    // res 格式: {success: true, data: {id, username, is_active}}
-    if (res.success && res.data) {
-      userInfo.value = res.data
-    } else {
+  const fetchUserInfo = async () => {
+    if (!token.value) {
       userInfo.value = null
+      return
     }
-    return userInfo.value
-  } catch (error) {
-    console.error('获取用户信息失败:', error)
-    userInfo.value = null
-    if (error.response?.status === 401) {
-      logout()
-      window.location.href = '/login'
+    try {
+      const res = await getCurrentUser()
+      if (res.success && res.data) {
+        userInfo.value = res.data
+      } else {
+        userInfo.value = null
+      }
+      return userInfo.value
+    } catch (error) {
+      console.error('获取用户信息失败:', error)
+      userInfo.value = null
+      if (error.response?.status === 401) {
+        logout()
+        window.location.href = '/login'
+      }
+      throw error
     }
-    throw error
   }
-}
 
   const logout = () => {
     token.value = ''

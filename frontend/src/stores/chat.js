@@ -32,50 +32,7 @@ const apiFetch = async (url, options = {}) => {
   return res.json()
 }
 
-// ==================== 【关键修复】超健壮 SSE 解析 ====================
-const parseSSEEvents = (text) => {
-  /**
-   * 解析 SSE 文本为事件数组
-   * 兼容：\n\n 分隔、\r\n\r\n 分隔、多余空行、多行 data
-   */
-  if (!text || !text.trim()) return []
-
-  // 统一换行符为 \n
-  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-
-  // 按 \n\n 分割事件块（兼容多个连续空行）
-  const rawBlocks = normalized.split(/\n\n+/)
-  const events = []
-
-  for (const rawBlock of rawBlocks) {
-    const block = rawBlock.trim()
-    if (!block) continue
-
-    const lines = block.split('\n')
-    let eventType = 'message'
-    const dataParts = []
-
-    for (const rawLine of lines) {
-      const line = rawLine.trim()
-      if (!line) continue
-
-      if (line.startsWith('event:')) {
-        eventType = line.slice(6).trim()
-      } else if (line.startsWith('data:')) {
-        // data: 后面可能有一个空格，也可能没有
-        dataParts.push(line.slice(5).trimStart())
-      }
-    }
-
-    // 只收集有 data 或特殊事件类型的
-    if (dataParts.length > 0 || ['session', 'done', 'error'].includes(eventType)) {
-      events.push({ eventType, content: dataParts.join('\n') })
-    }
-  }
-
-  return events
-}
-
+// ==================== 增量 SSE 解析（修复重复输出 + onDone 防重）====================
 const sendMessageInline = (data, callbacks) => {
   return new Promise((resolve, reject) => {
     const { onSession, onMessage, onDone, onError } = callbacks
@@ -88,72 +45,103 @@ const sendMessageInline = (data, callbacks) => {
     if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
 
     let lastLen = 0
+    let sseBuffer = ''      // 缓存不完整的 SSE 数据
     let messageCount = 0
     let sessionReceived = false
-    let processedTextLen = 0  // 记录已处理到的位置，避免重复处理
+    let doneCalled = false   // 【新增】防重标记
 
-    // 处理新增文本中的 SSE 事件
-    const processNewText = (fullText, isFinal = false) => {
-      // 只处理新增部分
-      const newText = fullText.slice(processedTextLen)
-      if (!newText.trim()) return
+    // 【新增】安全的 onDone 调用，防止重复触发
+    const safeOnDone = () => {
+      if (!doneCalled) {
+        doneCalled = true
+        onDone?.()
+      }
+    }
 
-      const events = parseSSEEvents(newText)
-      console.log(`[SSE] 解析到 ${events.length} 个事件 (新增 ${newText.length} 字节)`)
+    // 解析并处理一个 SSE 事件块
+    const processBlock = (block) => {
+      const lines = block.split('\n')
+      let eventType = 'message'
+      const dataParts = []
 
-      for (const { eventType, content } of events) {
-        console.log(`[SSE] 事件: type=${eventType}, len=${content?.length || 0}, content=${content?.slice(0, 30)}`)
-
-        if (eventType === 'session') {
-          sessionReceived = true
-          onSession?.(content)
-        }
-        else if (eventType === 'message' && content) {
-          messageCount++
-          onMessage?.(content)
-        }
-        else if (eventType === 'done') {
-          onDone?.()
-        }
-        else if (eventType === 'error') {
-          onError?.(content)
+      for (const rawLine of lines) {
+        const line = rawLine.trim()
+        if (!line) continue
+        if (line.startsWith('event:')) {
+          eventType = line.slice(6).trim()
+        } else if (line.startsWith('data:')) {
+          dataParts.push(line.slice(5).trimStart())
         }
       }
 
-      // 更新已处理位置（如果不是最终处理，留一点缓冲给不完整的块）
+      const content = dataParts.join('\n')
+
+      if (eventType === 'session') {
+        sessionReceived = true
+        onSession?.(content)
+      } else if (eventType === 'message' && content) {
+        messageCount++
+        onMessage?.(content)
+      } else if (eventType === 'done') {
+        safeOnDone()   // 【改】用防重版本
+      } else if (eventType === 'error') {
+        onError?.(content)
+      }
+    }
+
+    // 从 buffer 中提取完整事件（以 \n\n 结尾）并处理
+    const flushBuffer = (isFinal = false) => {
+      // 统一换行符
+      let text = sseBuffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+
       if (isFinal) {
-        processedTextLen = fullText.length
-      } else {
-        // 找到最后一个完整 \n\n 的位置
-        const lastDoubleNewline = fullText.lastIndexOf('\n\n')
-        if (lastDoubleNewline > processedTextLen) {
-          processedTextLen = lastDoubleNewline + 2
+        // 最终处理：剩余所有内容都强制解析
+        const blocks = text.split(/\n\n+/)
+        for (const block of blocks) {
+          if (block.trim()) processBlock(block.trim())
         }
+        sseBuffer = ''
+        return
+      }
+
+      // 只处理以 \n\n 结尾的完整事件
+      const blocks = text.split('\n\n')
+      // 最后一个块可能不完整，保留到 buffer
+      sseBuffer = blocks.pop() || ''
+
+      for (const block of blocks) {
+        if (block.trim()) processBlock(block.trim())
       }
     }
 
     xhr.onprogress = () => {
       const currentLen = xhr.responseText.length
       if (currentLen > lastLen) {
+        // 只取新增字节，追加到 buffer
+        const newText = xhr.responseText.slice(lastLen, currentLen)
         lastLen = currentLen
-        processNewText(xhr.responseText, false)
+        sseBuffer += newText
+        flushBuffer(false)
       }
     }
 
     xhr.onload = () => {
       const fullText = xhr.responseText
       console.log(`[SSE] onload 触发, responseText 总长度: ${fullText.length}`)
-      console.log(`[SSE] 原始内容前200字: ${fullText.slice(0, 200)}`)
 
-      // 最终处理：解析全部文本
-      processNewText(fullText, true)
+      // 把最后剩余的字节补进 buffer
+      const remaining = fullText.slice(lastLen)
+      if (remaining) {
+        sseBuffer += remaining
+        lastLen = fullText.length
+      }
+      flushBuffer(true)
 
       console.log(`[SSE] 请求完成, session=${sessionReceived}, 共 ${messageCount} 条 message`)
 
-      // 如果还没触发 done，补一个
+      // 兜底：如果没有任何事件被解析，尝试备用解析
       if (!sessionReceived && messageCount === 0 && fullText.length > 0) {
         console.warn('[SSE] 警告: 没有解析到任何事件，尝试备用解析...')
-        // 备用：直接按行查找 data:
         const lines = fullText.split('\n')
         for (const line of lines) {
           const trimmed = line.trim()
@@ -167,7 +155,7 @@ const sendMessageInline = (data, callbacks) => {
         }
       }
 
-      onDone?.()
+      safeOnDone()   // 【改】用防重版本
       resolve()
     }
 

@@ -36,6 +36,15 @@ class CRUDChatSession(CRUDBase[ChatSession]):
         )
         return result.scalars().all()
 
+    # 【新增】更新会话（用于自动标题生成）
+    async def update(self, db: AsyncSession, *, db_obj: ChatSession, obj_in: dict) -> ChatSession:
+        """更新会话字段"""
+        for field, value in obj_in.items():
+            setattr(db_obj, field, value)
+        await db.commit()
+        await db.refresh(db_obj)
+        return db_obj
+
 
 class CRUDChatMessage(CRUDBase[ChatMessage]):
     """消息 CRUD"""

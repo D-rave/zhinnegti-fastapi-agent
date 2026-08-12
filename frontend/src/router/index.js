@@ -27,10 +27,10 @@ const routes = [
     meta: { requiresAuth: true, title: '个人中心' }
   },
   {
-    path: '/admin',
-    name: 'Admin',
-    component: () => import('@/views/AdminView.vue'),
-    meta: { requiresAuth: true, requiresAdmin: true, title: '管理后台' }
+    path: '/dashboard',
+    name: 'Dashboard',
+    component: () => import('@/views/AdminView.vue'),  // 复用原组件
+    meta: { requiresAuth: true, title: '用量监控' }     // 【改】路由名和标题
   },
   {
     path: '/:pathMatch(.*)*',
@@ -45,26 +45,16 @@ const router = createRouter({
   routes
 })
 
-// 路由守卫
 router.beforeEach((to, from, next) => {
   const userStore = useUserStore()
 
-  // 设置页面标题
   document.title = to.meta.title ? `${to.meta.title} - 智扫通` : '智扫通智能客服'
 
-  // 需要登录但未登录
   if (to.meta.requiresAuth && !userStore.isLoggedIn) {
     next('/login')
     return
   }
 
-  // 需要管理员权限
-  if (to.meta.requiresAdmin && !userStore.isAdmin) {
-    next('/')
-    return
-  }
-
-  // 已登录用户访问登录页，重定向到首页
   if ((to.path === '/login' || to.path === '/register') && userStore.isLoggedIn) {
     next('/')
     return

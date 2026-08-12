@@ -8,15 +8,16 @@ from utils.file_handler import pdf_loader, txt_loader, listdir_with_allowed_type
 from utils.logger_handler import logger
 import os
 
+from core.dashscope_usage_tracker import usage_tracker, LLMUsageRecord
+
 
 class VectorStoreService:
-    def __init__(self):#构建chroma向量数据库实例
+    def __init__(self):
         self.vector_store = Chroma(
             collection_name=chroma_conf["collection_name"],
             embedding_function=embed_model,
             persist_directory=chroma_conf["persist_directory"],
         )
-#初始化文本分隔器，递归字符文本分割器
         self.spliter = RecursiveCharacterTextSplitter(
             chunk_size=chroma_conf["chunk_size"],
             chunk_overlap=chroma_conf["chunk_overlap"],
@@ -27,26 +28,28 @@ class VectorStoreService:
     def get_retriever(self):
         return self.vector_store.as_retriever(search_kwargs={"k": chroma_conf["k"]})
 
+    def _estimate_embedding_tokens(self, documents: list[Document]) -> int:
+        """
+        估算 Embedding Token 数
+        text-embedding-v4 按字符数/2 估算（中文为主，保守估计）
+        """
+        total_chars = sum(len(d.page_content) for d in documents)
+        return int(total_chars / 2)
+
     def load_document(self):
         """
         从数据文件夹内读取数据文件，转为向量存入向量库
         要计算文件的MD5做去重
-        :return: None
         """
-
         def check_md5_hex(md5_for_check: str):
             if not os.path.exists(get_abs_path(chroma_conf["md5_hex_store"])):
-                # 创建文件
                 open(get_abs_path(chroma_conf["md5_hex_store"]), "w", encoding="utf-8").close()
-                return False            # md5 没处理过
-
+                return False
             with open(get_abs_path(chroma_conf["md5_hex_store"]), "r", encoding="utf-8") as f:
                 for line in f.readlines():
-                    line = line.strip()
-                    if line == md5_for_check:
-                        return True     # md5 处理过
-
-                return False            # md5 没处理过
+                    if line.strip() == md5_for_check:
+                        return True
+            return False
 
         def save_md5_hex(md5_for_check: str):
             with open(get_abs_path(chroma_conf["md5_hex_store"]), "a", encoding="utf-8") as f:
@@ -55,10 +58,8 @@ class VectorStoreService:
         def get_file_documents(read_path: str):
             if read_path.endswith("txt"):
                 return txt_loader(read_path)
-
             if read_path.endswith("pdf"):
                 return pdf_loader(read_path)
-
             return []
 
         allowed_files_path: list[str] = listdir_with_allowed_type(
@@ -67,7 +68,6 @@ class VectorStoreService:
         )
 
         for path in allowed_files_path:
-            # 获取文件的MD5
             md5_hex = get_file_md5_hex(path)
 
             if check_md5_hex(md5_hex):
@@ -87,29 +87,47 @@ class VectorStoreService:
                     logger.warning(f"[加载知识库]{path}分片后没有有效文本内容，跳过")
                     continue
 
-                # 将内容存入向量库
+                # 存入向量库
                 self.vector_store.add_documents(split_document)
 
-                # 记录这个已经处理好的文件的md5，避免下次重复加载
-                save_md5_hex(md5_hex)
+                # 【新增】追踪 Embedding 用量
+                est_tokens = self._estimate_embedding_tokens(split_document)
+                usage_tracker.record_sync(LLMUsageRecord(
+                    model="text-embedding-v4",
+                    input_tokens=est_tokens,
+                    output_tokens=0,
+                    endpoint="vector_store.load_document"
+                ))
 
+                save_md5_hex(md5_hex)
                 logger.info(f"[加载知识库]{path} 内容加载成功")
+
             except Exception as e:
-                # exc_info为True会记录详细的报错堆栈，如果为False仅记录报错信息本身
                 logger.error(f"[加载知识库]{path}加载失败：{str(e)}", exc_info=True)
                 continue
+
+    def add_documents_with_tracking(self, documents: list[Document]):
+        """
+        【新增】带用量追踪的添加文档接口（供 admin.py 调用）
+        """
+        if not documents:
+            return
+        self.vector_store.add_documents(documents)
+
+        est_tokens = self._estimate_embedding_tokens(documents)
+        usage_tracker.record_sync(LLMUsageRecord(
+            model="text-embedding-v4",
+            input_tokens=est_tokens,
+            output_tokens=0,
+            endpoint="vector_store.add_documents"
+        ))
 
 
 if __name__ == '__main__':
     vs = VectorStoreService()
-
     vs.load_document()
-
     retriever = vs.get_retriever()
-
     res = retriever.invoke("迷路")
     for r in res:
         print(r.page_content)
         print("-"*20)
-
-

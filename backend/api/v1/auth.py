@@ -4,11 +4,11 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from schemas.common import ResponseBase, DataResponse
 from models.db import get_db
 from models.user import User
-from schemas.auth import UserCreate, Token, UserLogin, UserResponse  # ← 新增 UserLogin
-from schemas.common import ResponseBase
+from schemas.auth import UserCreate, Token, UserLogin, UserResponse
 from crud.user import user as user_crud
 from core.security import (
     verify_password,
@@ -48,7 +48,7 @@ async def register(user_in: UserCreate, db: AsyncSession = Depends(get_db)):
 
 @router.post("/login", response_model=Token)
 async def login(
-    login_data: UserLogin,  # ← 改为 JSON body
+    login_data: UserLogin,
     db: AsyncSession = Depends(get_db)
 ):
     """用户登录（JSON 格式）"""
@@ -77,11 +77,21 @@ async def get_current_user_info(
     current_user: User = Depends(get_current_user)
 ):
     """获取当前用户信息"""
+    # 【关键】判断管理员身份
+    # 方案A：如果数据库有 is_admin 字段
+    is_admin = getattr(current_user, 'is_admin', False)
+
+    # 方案B：临时方案 - id 为 1 的用户视为管理员（数据库无 is_admin 字段时使用）
+    # is_admin = current_user.id == 1
+
     return {
         "success": True,
         "data": {
             "id": current_user.id,
             "username": current_user.username,
-            "is_active": current_user.is_active
+            "email": getattr(current_user, 'email', None),
+            "is_active": current_user.is_active,
+            "is_admin": is_admin,           # 【新增】前端 isAdmin 依赖此字段
+            "role": "admin" if is_admin else "user"  # 【新增】兼容前端 role 判断
         }
     }
