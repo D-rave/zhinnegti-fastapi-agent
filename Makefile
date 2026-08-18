@@ -62,3 +62,9 @@ clean:
 	find . -type d -name "htmlcov" -exec rm -rf {} + 2>/dev/null || true
 	rm -rf frontend/dist frontend/node_modules/.cache
 	rm -rf backend/.mypy_cache
+# 压力测试
+locust:
+	cd backend && locust -f locustfile.py --host http://localhost:8011
+
+locust-headless:
+	cd backend && locust -f locustfile.py --host http://localhost:8011 --headless -u 100 -r 10 -t 60s --csv=locust_report

@@ -29,7 +29,14 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("[系统启动] 数据库表创建/检查完成")
-
+    # 【新增】加载知识库到向量库
+    try:
+        from rag.vector_store import VectorStoreService
+        vs = VectorStoreService()
+        vs.load_document()
+        logger.info("[系统启动] 知识库向量加载完成")
+    except Exception as e:
+        logger.warning(f"[系统启动] 知识库加载失败（不影响服务启动）: {e}")
     # 连接 MCP 服务器
     from mcp_client import get_mcp_client
     mcp = await get_mcp_client()

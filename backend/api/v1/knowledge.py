@@ -25,7 +25,7 @@ async def query_knowledge(
     用于测试知识库检索效果
     """
     try:
-        result = rag_service.rag_summarize(query)
+        result = await rag_service.rag_summarize(query)
         return {
             "success": True,
             "data": {
