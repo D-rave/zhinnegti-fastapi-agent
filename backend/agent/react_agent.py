@@ -1,6 +1,10 @@
 """
-ReAct Agent - V5.1 Function Calling 版（修复通义千问 ToolMessage 兼容性问题）
+ReAct Agent - V5.2 Function Calling 版（接入中间层管道）
 基于通义千问原生 tool_calls，用 HumanMessage 替代 ToolMessage 回传结果
+
+V5.2 参照 chat-langchain 的中间件管道思路，新增模型中间处理能力：
+入口守卫 → 话题护栏 → 历史摘要压缩 → 模型重试/降级 → 工具重试
+（配置见 config/agent.yml 的 middleware 段，各组件位于 agent/middleware/）
 """
 import asyncio
 import json
@@ -15,8 +19,15 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from model.factory import ChatModelFactory
 from utils.prompt_loader import load_system_prompts
 from utils.logger_handler import logger
+from utils.config_handler import agent_conf
 from agent.tools.agent_tools import rag_summarize
 from core.dashscope_usage_tracker import track_llm_call
+from agent.middleware.ingress_guards import IngressGuard, MAX_MESSAGE_CHARS
+from agent.middleware.guardrails import GuardrailsService
+from agent.middleware.model_retry import ModelRetryPolicy
+from agent.middleware.tool_retry import ToolRetryPolicy
+from agent.middleware.summarization import ConversationSummarizer
+from agent.middleware.model_fallback import FallbackChatModel, DEFAULT_FALLBACK_MODELS
 
 MAX_STEPS = 5
 
@@ -29,7 +40,8 @@ TOOL_ALIASES = {
 
 
 class ReactAgent:
-    def __init__(self, extra_tools=None, memory_text="", user_id=None, session_id=None):
+    def __init__(self, extra_tools=None, memory_text="", user_id=None, session_id=None,
+                 enable_middleware: bool = True):
         self.model_name = "qwen-max"
         self.user_id = user_id
         self.session_id = session_id
@@ -42,8 +54,17 @@ class ReactAgent:
 
         self._enhance_tool_descriptions()
 
-        base_llm = ChatModelFactory().generator()
-        self.llm = base_llm.bind_tools(self.tools)
+        # ==================== 中间层管道（参照 chat-langchain） ====================
+        self._init_middleware(enable_middleware)
+
+        if self.enable_middleware and self.model_fallback is not None:
+            # 主模型 + 降级链，每次调用自带重试策略
+            self.llm = self.model_fallback.bind_tools(self.tools)
+            chain_names = [name for name, _ in self.model_fallback.models]
+            logger.info(f"[Agent] 模型降级链: {' -> '.join(chain_names)}")
+        else:
+            base_llm = ChatModelFactory().generator()
+            self.llm = base_llm.bind_tools(self.tools)
         logger.info(f"[Agent] Function Calling 已绑定 {len(self.tools)} 个工具")
 
         base_prompt = load_system_prompts()
@@ -64,6 +85,90 @@ class ReactAgent:
 3. 获得工具结果后，如果信息足够直接回答；不够则继续调用（最多 {MAX_STEPS} 次）
 4. 如果工具返回空或错误，诚实告知用户，不要编造信息
 """
+
+    def _init_middleware(self, enable_middleware: bool = True):
+        """
+        初始化中间层管道组件（参照 chat-langchain 的中间件链）。
+        配置来自 config/agent.yml 的 middleware 段；初始化失败时降级为
+        无中间层模式，保证基础对话能力可用。
+        """
+        self.enable_middleware = enable_middleware
+        self.ingress_guard: Optional[IngressGuard] = None
+        self.guardrails: Optional[GuardrailsService] = None
+        self.model_retry: Optional[ModelRetryPolicy] = None
+        self.tool_retry: Optional[ToolRetryPolicy] = None
+        self.summarizer: Optional[ConversationSummarizer] = None
+        self.model_fallback: Optional[FallbackChatModel] = None
+
+        if not enable_middleware:
+            return
+
+        mw_conf = (agent_conf or {}).get("middleware", {}) or {}
+        try:
+            # 入口守卫
+            self.ingress_guard = IngressGuard(
+                max_chars=mw_conf.get("ingress_max_chars", MAX_MESSAGE_CHARS)
+            )
+
+            # 模型重试策略（降级链上每个模型共用同一策略参数）
+            retry_conf = mw_conf.get("model_retry", {}) or {}
+            self.model_retry = ModelRetryPolicy(
+                max_retries=retry_conf.get("max_retries", 2),
+                initial_delay=retry_conf.get("initial_delay", 0.5),
+                backoff_factor=retry_conf.get("backoff_factor", 2.0),
+            )
+
+            # 模型降级链
+            fallback_models = tuple(
+                (mw_conf.get("model_fallback", {}) or {}).get(
+                    "models", DEFAULT_FALLBACK_MODELS
+                )
+            )
+            self.model_fallback = FallbackChatModel.from_model_names(
+                model_names=fallback_models, retry_policy=self.model_retry
+            )
+            self.model_name = self.model_fallback.model_name
+
+            # 工具重试策略
+            tool_conf = mw_conf.get("tool_retry", {}) or {}
+            self.tool_retry = ToolRetryPolicy(
+                max_attempts=tool_conf.get("max_attempts", 3),
+                initial_delay=tool_conf.get("initial_delay", 0.5),
+                backoff_factor=tool_conf.get("backoff_factor", 2.0),
+            )
+
+            # 话题护栏
+            guard_conf = mw_conf.get("guardrails", {}) or {}
+            if guard_conf.get("enabled", True):
+                from agent.middleware.guardrails import DEFAULT_CLASSIFIER_MODELS
+
+                classifier_models = tuple(
+                    guard_conf.get("classifier_models", DEFAULT_CLASSIFIER_MODELS)
+                )
+                factory = ChatModelFactory()
+                classifier_llms = [
+                    (name, factory._get_model(name)) for name in classifier_models
+                ]
+                self.guardrails = GuardrailsService(
+                    classifier_llms=classifier_llms,
+                    block_off_topic=guard_conf.get("block_off_topic", True),
+                    max_retries=guard_conf.get("max_retries", 2),
+                    timeout_seconds=guard_conf.get("timeout_seconds", 10),
+                )
+
+            # 历史摘要压缩
+            sum_conf = mw_conf.get("summarization", {}) or {}
+            self.summarizer = ConversationSummarizer(
+                trigger_tokens=sum_conf.get("trigger_tokens", 8_000),
+                keep_tokens=sum_conf.get("keep_tokens", 2_000),
+            )
+
+            logger.info("[Agent] 中间层管道初始化完成（守卫/护栏/重试/降级/摘要）")
+        except Exception as e:
+            logger.error(f"[Agent] 中间层管道初始化失败，降级为基础模式: {e}")
+            self.enable_middleware = False
+            self.guardrails = None
+            self.model_fallback = None
 
     def _enhance_tool_descriptions(self):
         for tool in self.tools:
@@ -103,7 +208,7 @@ class ReactAgent:
         return TOOL_ALIASES.get(name, name)
 
     async def _invoke_tool(self, tool, params: dict) -> str:
-        try:
+        async def _do_call() -> str:
             if hasattr(tool, "coroutine") and tool.coroutine:
                 result = await tool.coroutine(**params)
             elif hasattr(tool, "func") and tool.func:
@@ -113,6 +218,12 @@ class ReactAgent:
             else:
                 result = await tool.ainvoke(params)
             return str(result)
+
+        try:
+            if self.tool_retry is not None:
+                # 工具重试策略：瞬时故障指数退避，失败返回模型可读错误（不抛异常）
+                return await self.tool_retry.execute(tool.name, _do_call)
+            return await _do_call()
         except Exception as e:
             logger.error(f"[Agent] 工具 {tool.name} 调用失败: {e}", exc_info=True)
             return f"工具调用失败: {str(e)}"
@@ -217,6 +328,9 @@ class ReactAgent:
                     messages.append(HumanMessage(content=content))
                 elif role == "assistant":
                     messages.append(AIMessage(content=content))
+                elif role == "system":
+                    # 摘要压缩产生的"此前对话摘要"等 system 历史，必须透传给模型
+                    messages.append(SystemMessage(content=content))
         messages.append(HumanMessage(content=query))
         return messages
 
@@ -331,9 +445,45 @@ class ReactAgent:
 
         return True
 
+    # ==================== 中间层管道：请求预处理 ====================
+    async def _preprocess(self, query: str, history: list = None) -> Dict[str, Any]:
+        """
+        请求进入 Agent 循环前的中间层处理（参照 chat-langchain 管道顺序）：
+        1. 入口守卫：截断超长输入
+        2. 话题护栏：小模型分类，拦截越界请求（fail-open）
+        3. 摘要压缩：历史超阈值时压缩，防上下文溢出
+
+        :return: {"query": 处理后的 query, "history": 处理后的 history,
+                  "blocked": bool, "rejection": str | None}
+        """
+        # 1) 入口守卫
+        if self.ingress_guard is not None:
+            query = self.ingress_guard.apply(query)
+
+        # 2) 话题护栏（fail-open，护栏故障不阻断用户）
+        if self.guardrails is not None:
+            check = await self.guardrails.check(query, history)
+            if not check["allowed"]:
+                return {
+                    "query": query,
+                    "history": history,
+                    "blocked": True,
+                    "rejection": check["rejection"],
+                }
+
+        # 3) 历史摘要压缩
+        if self.summarizer is not None and history:
+            history = await self.summarizer.summarize(history)
+
+        return {"query": query, "history": history, "blocked": False, "rejection": None}
+
     # ==================== 非流式执行 ====================
     async def async_execute(self, query: str, history: list = None) -> str:
-        messages = self._build_messages(query, history)
+        pre = await self._preprocess(query, history)
+        if pre["blocked"]:
+            return pre["rejection"]
+
+        messages = self._build_messages(pre["query"], pre["history"])
 
         for step in range(1, MAX_STEPS + 1):
             logger.info(f"[Agent] === ReAct 第 {step}/{MAX_STEPS} 轮 ===")
@@ -361,7 +511,12 @@ class ReactAgent:
 
     # ==================== 流式执行 ====================
     async def async_execute_stream(self, query: str, history: list = None):
-        messages = self._build_messages(query, history)
+        pre = await self._preprocess(query, history)
+        if pre["blocked"]:
+            yield pre["rejection"]
+            return
+
+        messages = self._build_messages(pre["query"], pre["history"])
 
         for step in range(1, MAX_STEPS + 1):
             logger.info(f"[Agent] === ReAct 流式第 {step}/{MAX_STEPS} 轮 ===")

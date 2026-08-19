@@ -1,1 +1,37 @@
 external_data_path: data/external/records.csv
+external_data_path: data/external/records.csv
+
+# ==================== Agent 中间层管道配置 ====================
+# 参照 chat-langchain 的中间件思路：入口守卫 → 话题护栏 → 摘要压缩 → 模型重试/降级 → 工具重试
+middleware:
+  # 入口守卫：单条用户输入字符上限
+  ingress_max_chars: 50000
+
+  # 话题护栏：小模型在主模型前做 ALLOWED/BLOCKED 分类
+  guardrails:
+    enabled: true
+    block_off_topic: true          # false = 只记录不拦截（观测模式）
+    classifier_models: ["qwen-turbo", "qwen-max"]   # 分类模型降级链（轻量模型优先）
+    max_retries: 2                 # 每个分类模型各自的重试预算
+    timeout_seconds: 10            # 单次分类调用超时
+
+  # 模型调用重试（指数退避）
+  model_retry:
+    max_retries: 2
+    initial_delay: 0.5
+    backoff_factor: 2.0
+
+  # 模型降级链：主模型故障时依次切换
+  model_fallback:
+    models: ["qwen-max", "qwen-plus", "qwen-turbo"]
+
+  # 工具调用重试（瞬时故障：429/5xx/超时）
+  tool_retry:
+    max_attempts: 3
+    initial_delay: 0.5
+    backoff_factor: 2.0
+
+  # 对话历史摘要压缩（token 为估算值：字符数/2）
+  summarization:
+    trigger_tokens: 8000           # 历史超过该阈值才触发摘要
+    keep_tokens: 2000              # 摘要后保留最近消息的 token 预算
